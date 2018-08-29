@@ -683,6 +683,15 @@ func (fbo *folderBlockOps) getFileLocked(ctx context.Context,
 	return fblock, err
 }
 
+func (fbo *folderBlockOps) getIndirectFileBlockInfosLocked(
+	ctx context.Context, lState *lockState, kmd KeyMetadata, file path) (
+	[]BlockInfo, error) {
+	fbo.blockLock.AssertRLocked(lState)
+	var id keybase1.UserOrTeamID // Data reads don't depend on the id.
+	fd := fbo.newFileData(lState, file, id, kmd)
+	return fd.getIndirectFileBlockInfos(ctx)
+}
+
 // GetIndirectFileBlockInfos returns a list of BlockInfos for all
 // indirect blocks of the given file. If the returned error is a
 // recoverable one (as determined by
@@ -693,9 +702,7 @@ func (fbo *folderBlockOps) GetIndirectFileBlockInfos(ctx context.Context,
 	lState *lockState, kmd KeyMetadata, file path) ([]BlockInfo, error) {
 	fbo.blockLock.RLock(lState)
 	defer fbo.blockLock.RUnlock(lState)
-	var id keybase1.UserOrTeamID // Data reads don't depend on the id.
-	fd := fbo.newFileData(lState, file, id, kmd)
-	return fd.getIndirectFileBlockInfos(ctx)
+	return fbo.getIndirectFileBlockInfosLocked(ctx, lState, kmd, file)
 }
 
 // GetIndirectDirBlockInfos returns a list of BlockInfos for all
@@ -710,7 +717,7 @@ func (fbo *folderBlockOps) GetIndirectDirBlockInfos(
 	fbo.blockLock.RLock(lState)
 	defer fbo.blockLock.RUnlock(lState)
 	var id keybase1.UserOrTeamID // Data reads don't depend on the id.
-	fd := fbo.newDirData(lState, dir, id, kmd)
+	fd := fbo.newDirDataLocked(lState, dir, id, kmd)
 	return fd.getIndirectDirBlockInfos(ctx)
 }
 
@@ -760,14 +767,13 @@ func (fbo *folderBlockOps) ClearChargedTo(lState *lockState) {
 // It returns the new top pointer of the copy, and all the new child
 // pointers in the copy.  It takes a custom DirtyBlockCache, which
 // directs where the resulting block copies are stored.
-func (fbo *folderBlockOps) DeepCopyFile(
+func (fbo *folderBlockOps) deepCopyFileLocked(
 	ctx context.Context, lState *lockState, kmd KeyMetadata, file path,
 	dirtyBcache DirtyBlockCache, dataVer DataVer) (
 	newTopPtr BlockPointer, allChildPtrs []BlockPointer, err error) {
 	// Deep copying doesn't alter any data in use, it only makes copy,
 	// so only a read lock is needed.
-	fbo.blockLock.RLock(lState)
-	defer fbo.blockLock.RUnlock(lState)
+	fbo.blockLock.AssertRLocked(lState)
 	chargedTo, err := chargedToForTLF(
 		ctx, fbo.config.KBPKI(), fbo.config.KBPKI(), kmd.GetTlfHandle())
 	if err != nil {
@@ -905,7 +911,7 @@ func (fbo *folderBlockOps) wrapWithBlockLock(fn func()) dirCacheUndoFn {
 	}
 }
 
-func (fbo *folderBlockOps) newDirData(lState *lockState,
+func (fbo *folderBlockOps) newDirDataLocked(lState *lockState,
 	dir path, chargedTo keybase1.UserOrTeamID, kmd KeyMetadata) *dirData {
 	fbo.blockLock.AssertAnyLocked(lState)
 	return newDirData(dir, chargedTo, fbo.config.Crypto(),
@@ -925,13 +931,14 @@ func (fbo *folderBlockOps) newDirData(lState *lockState,
 		}, fbo.log)
 }
 
-// newDirDataWithLBC creates a new `dirData` that reads from and puts
-// into a local block cache.  It is only intended for non-parallel
-// write-based usage.  If it reads a block out from anything but the
-// `lbc`, it makes a copy of it before inserting it into the `lbc`.
-func (fbo *folderBlockOps) newDirDataWithLBC(lState *lockState,
+// newDirDataWithLBCLocked creates a new `dirData` that reads from and
+// puts into a local block cache.  If it reads a block out from
+// anything but the `lbc`, it makes a copy of it before inserting it
+// into the `lbc`.
+func (fbo *folderBlockOps) newDirDataWithLBCLocked(lState *lockState,
 	dir path, chargedTo keybase1.UserOrTeamID, kmd KeyMetadata,
 	lbc localBcache) *dirData {
+	fbo.blockLock.AssertRLocked(lState)
 	return newDirData(dir, chargedTo, fbo.config.Crypto(),
 		fbo.config.BlockSplitter(), kmd,
 		func(ctx context.Context, kmd KeyMetadata, ptr BlockPointer,
@@ -941,17 +948,17 @@ func (fbo *folderBlockOps) newDirDataWithLBC(lState *lockState,
 				return block, true, nil
 			}
 
-			if rtype == blockReadParallel {
-				return nil, false, errors.New(
-					"LBC must be used with parallel reads")
+			lState := lState
+			getRtype := rtype
+			switch rtype {
+			case blockReadParallel:
+				lState = nil
+			case blockWrite:
+				getRtype = blockRead
 			}
 
-			// Lock and fetch for reading only, we want any dirty
-			// blocks to go into the lbc.
-			fbo.blockLock.RLock(lState)
-			defer fbo.blockLock.RUnlock(lState)
 			block, wasDirty, err := fbo.getDirLocked(
-				ctx, lState, kmd, ptr, dir, blockRead)
+				ctx, lState, kmd, ptr, dir, getRtype)
 			if err != nil {
 				return nil, false, err
 			}
@@ -967,6 +974,19 @@ func (fbo *folderBlockOps) newDirDataWithLBC(lState *lockState,
 			lbc[ptr] = block.(*DirBlock)
 			return nil
 		}, fbo.log)
+}
+
+// newDirDataWithLBC is like `newDirDataWithLBCLocked`, but it must be
+// called with `blockLock` unlocked, and the returned function must be
+// called when the returned `dirData` is no longer in use.
+func (fbo *folderBlockOps) newDirDataWithLBC(
+	lState *lockState, dir path, chargedTo keybase1.UserOrTeamID,
+	kmd KeyMetadata, lbc localBcache) (*dirData, func()) {
+	// Lock and fetch for reading only, we want any dirty
+	// blocks to go into the lbc.
+	fbo.blockLock.RLock(lState)
+	undoFn := func() { fbo.blockLock.RUnlock(lState) }
+	return fbo.newDirDataWithLBCLocked(lState, dir, chargedTo, kmd, lbc), undoFn
 }
 
 func (fbo *folderBlockOps) makeDirDirtyLocked(
@@ -1000,7 +1020,7 @@ func (fbo *folderBlockOps) updateParentDirEntryLocked(
 	now := fbo.nowUnixNano()
 	pp := *dir.parentPath()
 	if pp.isValid() {
-		dd := fbo.newDirData(lState, pp, chargedTo, kmd)
+		dd := fbo.newDirDataLocked(lState, pp, chargedTo, kmd)
 		de, err := dd.lookup(ctx, dir.tailName())
 		if err != nil {
 			return nil, err
@@ -1052,7 +1072,7 @@ func (fbo *folderBlockOps) addDirEntryInCacheLocked(
 	if err != nil {
 		return nil, err
 	}
-	dd := fbo.newDirData(lState, dir, chargedTo, kmd)
+	dd := fbo.newDirDataLocked(lState, dir, chargedTo, kmd)
 	unrefs, err := dd.addEntry(ctx, newName, newDe)
 	if err != nil {
 		return nil, err
@@ -1097,7 +1117,7 @@ func (fbo *folderBlockOps) removeDirEntryInCacheLocked(
 	if err != nil {
 		return nil, err
 	}
-	dd := fbo.newDirData(lState, dir, chargedTo, kmd)
+	dd := fbo.newDirDataLocked(lState, dir, chargedTo, kmd)
 	unrefs, err := dd.removeEntry(ctx, oldName)
 	if err != nil {
 		return nil, err
@@ -1245,7 +1265,7 @@ func (fbo *folderBlockOps) setCachedAttrLocked(
 	var de DirEntry
 	var unlinkedNode Node
 
-	dd := fbo.newDirData(lState, dir, chargedTo, kmd)
+	dd := fbo.newDirDataLocked(lState, dir, chargedTo, kmd)
 	de, err = dd.lookup(ctx, name)
 	if _, noExist := errors.Cause(err).(NoSuchNameError); noExist {
 		// The node may be unlinked.
@@ -1336,7 +1356,7 @@ func (fbo *folderBlockOps) GetChildren(
 	dir path) (map[string]EntryInfo, error) {
 	fbo.blockLock.RLock(lState)
 	defer fbo.blockLock.RUnlock(lState)
-	dd := fbo.newDirData(lState, dir, keybase1.UserOrTeamID(""), kmd)
+	dd := fbo.newDirDataLocked(lState, dir, keybase1.UserOrTeamID(""), kmd)
 	return dd.getChildren(ctx)
 }
 
@@ -1347,7 +1367,7 @@ func (fbo *folderBlockOps) GetEntries(
 	dir path) (map[string]DirEntry, error) {
 	fbo.blockLock.RLock(lState)
 	defer fbo.blockLock.RUnlock(lState)
-	dd := fbo.newDirData(lState, dir, keybase1.UserOrTeamID(""), kmd)
+	dd := fbo.newDirDataLocked(lState, dir, keybase1.UserOrTeamID(""), kmd)
 	return dd.getEntries(ctx)
 }
 
@@ -1364,7 +1384,7 @@ func (fbo *folderBlockOps) getEntryLocked(ctx context.Context,
 		return kmd.GetRootDirEntry(), nil
 	}
 
-	dd := fbo.newDirData(
+	dd := fbo.newDirDataLocked(
 		lState, *file.parentPath(), keybase1.UserOrTeamID(""), kmd)
 	de, err = dd.lookup(ctx, file.tailName())
 	_, noExist := errors.Cause(err).(NoSuchNameError)
@@ -1391,7 +1411,7 @@ func (fbo *folderBlockOps) updateEntryLocked(ctx context.Context,
 		return err
 	}
 	parentPath := *file.parentPath()
-	dd := fbo.newDirData(lState, parentPath, chargedTo, kmd)
+	dd := fbo.newDirDataLocked(lState, parentPath, chargedTo, kmd)
 	unrefs, err := dd.updateEntry(ctx, file.tailName(), de)
 	_, noExist := errors.Cause(err).(NoSuchNameError)
 	if noExist && includeDeleted {
@@ -1541,12 +1561,11 @@ func (fbo *folderBlockOps) GetDirtyDirBlockRefs(lState *lockState) []BlockRef {
 	return dirtyRefs
 }
 
-// GetDirtyDirUnrefs returns a list of block infos that need to be
+// getDirtyDirUnrefsLocked returns a list of block infos that need to be
 // unreferenced for the given directory.
-func (fbo *folderBlockOps) GetDirtyDirUnrefs(
+func (fbo *folderBlockOps) getDirtyDirUnrefsLocked(
 	lState *lockState, ptr BlockPointer) []BlockInfo {
-	fbo.blockLock.RLock(lState)
-	defer fbo.blockLock.RUnlock(lState)
+	fbo.blockLock.AssertRLocked(lState)
 	return fbo.dirtyDirs[ptr]
 }
 
@@ -2289,7 +2308,7 @@ func (fbo *folderBlockOps) clearAllDirtyDirsLocked(
 			FolderBranch: fbo.folderBranch,
 			path:         []pathNode{{ptr, ptr.String()}},
 		}
-		dd := fbo.newDirData(lState, dir, keybase1.UserOrTeamID(""), kmd)
+		dd := fbo.newDirDataLocked(lState, dir, keybase1.UserOrTeamID(""), kmd)
 		childPtrs, err := dd.getDirtyChildPtrs(ctx, dirtyBCache)
 		if err != nil {
 			fbo.log.CDebugf(ctx, "Failed to get child ptrs for %v: %+v",
@@ -2592,7 +2611,7 @@ func (fbo *folderBlockOps) startSyncWrite(ctx context.Context,
 
 	// Capture the current de before we release the block lock, so
 	// other deferred writes don't slip in.
-	dd := fbo.newDirData(lState, *file.parentPath(), chargedTo, md)
+	dd := fbo.newDirDataLocked(lState, *file.parentPath(), chargedTo, md)
 	de, err := dd.lookup(ctx, file.tailName())
 	if err != nil {
 		return nil, nil, syncState, nil, err
@@ -2637,15 +2656,18 @@ func prepDirtyEntryForSync(md *RootMetadata, si *syncInfo, dirtyDe *DirEntry) {
 func (fbo *folderBlockOps) mergeDirtyEntryWithLBC(
 	ctx context.Context, lState *lockState, file path, md KeyMetadata,
 	lbc localBcache, dirtyDe DirEntry) error {
-	fbo.blockLock.Lock(lState)
-	defer fbo.blockLock.Unlock(lState)
+	// Lock and fetch for reading only, any dirty blocks will go into
+	// the lbc.
+	fbo.blockLock.RLock(lState)
+	defer fbo.blockLock.RUnlock(lState)
 
 	chargedTo, err := fbo.getChargedToLocked(ctx, lState, md)
 	if err != nil {
 		return err
 	}
 
-	dd := fbo.newDirDataWithLBC(lState, *file.parentPath(), chargedTo, md, lbc)
+	dd := fbo.newDirDataWithLBCLocked(
+		lState, *file.parentPath(), chargedTo, md, lbc)
 	unrefs, err := dd.setEntry(ctx, file.tailName(), dirtyDe)
 	if err != nil {
 		return err
@@ -2974,7 +2996,7 @@ func (fbo *folderBlockOps) searchForNodesInDirLocked(ctx context.Context,
 	if err != nil {
 		return 0, err
 	}
-	dd := fbo.newDirData(lState, currDir, chargedTo, kmd)
+	dd := fbo.newDirDataLocked(lState, currDir, chargedTo, kmd)
 	entries, err := dd.getEntries(ctx)
 	if err != nil {
 		return 0, err
@@ -3322,7 +3344,7 @@ func (fbo *folderBlockOps) fastForwardDirAndChildrenLocked(ctx context.Context,
 	if err != nil {
 		return nil, nil, err
 	}
-	dd := fbo.newDirData(lState, currDir, chargedTo, kmd)
+	dd := fbo.newDirDataLocked(lState, currDir, chargedTo, kmd)
 	entries, err := dd.getEntries(ctx)
 	if err != nil {
 		return nil, nil, err
